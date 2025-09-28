@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Configurable Alarm Notification</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        /* Custom styling for the volume slider thumb */
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #4f46e5;
+            cursor: pointer;
+            box-shadow: 0 0 2px 0 rgba(0, 0, 0, 0.3);
+            margin-top: -7px;
+            transition: background 0.2s;
+        }
+        input[type=range]::-moz-range-thumb {
+            width: 16px;
+            height: 16px;
+            border: 0;
+            border-radius: 50%;
+            background: #4f46e5;
+            cursor: pointer;
+            box-shadow: 0 0 2px 0 rgba(0, 0, 0, 0.3);
+            transition: background 0.2s;
+        }
+        input[type=range] {
+            height: 2px;
+            background: linear-gradient(to right, #6366f1 0%, #6366f1 50%, #e0e7ff 50%, #e0e7ff 100%);
+            border-radius: 9999px; /* rounded-lg equivalent for track */
+        }
+    </style>
+
+    <!-- Lucide Icons -->
+    <script type="module">
+        import { createIcons } from 'https://unpkg.com/lucide@latest';
+        window.addEventListener('load', createIcons);
+    </script>
+
+    <!-- Tone.js CDN for Web Audio Synthesis -->
+    <script src="https://cdn.jsdelivr.net/npm/tone@14.7.71/build/Tone.min.js"></script>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        // import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        // setLogLevel('Debug'); // Uncomment to see Firebase logs
+
+        // --- Global Variables (provided by the environment) ---
+        const DUMMY_FIREBASE_CONFIG = { apiKey: 'dummy', authDomain: 'dummy', projectId: 'dummy' };
+        const isEnvironmentConfigProvided = typeof __firebase_config !== 'undefined' && __firebase_config !== '{}';
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = isEnvironmentConfigProvided ? JSON.parse(__firebase_config) : DUMMY_FIREBASE_CONFIG;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        // --- End Global Variables ---
+
+        // Default preference structure
+        const DEFAULT_PREFS = {
+            soundType: 'sine',
+            volume: 0.5,
+            pitch: 440,
+        };
+
+        // Available Tones for the alarm
+        const SOUND_OPTIONS = [
+            { value: 'sine', label: 'Gentle Chime' },
+            { value: 'square', label: 'Classic Beep' },
+            { value: 'sawtooth', label: 'Loud Siren' },
+            { value: 'triangle', label: 'Soft Bell' }
+        ];
+
+        let db = null;
+        let auth = null;
+        let userId = null;
+        let currentPrefs = { ...DEFAULT_PREFS };
+        let isSaved = true;
+        let synth = null;
+
+        // --- Tone.js Alarm Logic ---
+        const initializeSynth = () => {
+            if (!synth) {
+                synth = new Tone.PolySynth(Tone.Synth, {
+                    oscillator: { type: 'sine' },
+                    envelope: { attack: 0.05, decay: 0.5, sustain: 0, release: 0.5 },
+                }).toDestination();
+            }
+        };
+
+        window.playAlarm = (soundType, volume, pitch = 440) => {
+            if (!Tone) return; // Guard for Tone.js loading
+
+            if (!Tone.context.state || Tone.context.state !== 'running') {
+                Tone.start().catch(e => console.error("Tone.js context start failed:", e));
+            }
+            initializeSynth();
+
+            // Map 0-1.0 UI volume to a suitable dB range for Tone.js (-30dB to 0dB)
+            const dbVolume = volume === 0 ? -100 : Math.max(-30, 20 * Math.log10(volume));
+
+            // Update synth type and volume
+            synth.set({
+                oscillator: { type: soundType },
+                volume: dbVolume,
+            });
+
+            // Play a simple chord or sequence
+            const now = Tone.now();
+            // C4 and G4 played a half second apart
+            synth.triggerAttackRelease(pitch, '8n', now);
+            synth.triggerAttackRelease(pitch * 1.5, '8n', now + 0.5); 
+        };
+
+        // --- Firebase Functions ---
+        const getPrefsDocRef = () => {
+            if (!db || !userId) return null;
+            // Private data path: /artifacts/{appId}/users/{userId}/{collectionName}/
+            return doc(db, `artifacts/${appId}/users/${userId}/alarmSettings`, 'prefs');
+        };
+
+        const savePreferences = async (prefsToSave) => {
+            if (!db || !userId) {
+                console.error("Database or User ID not ready. Persistence is disabled.");
+                showFeedback("Persistence Disabled. Settings not saved.", true);
+                return;
+            }
+            const prefsDocRef = getPrefsDocRef();
+            if (!prefsDocRef) return;
+
+            try {
+                // Exponential backoff retry loop for saving
+                const MAX_RETRIES = 5;
+                for (let i = 0; i < MAX_RETRIES; i++) {
+                    try {
+                        await setDoc(prefsDocRef, prefsToSave, { merge: true });
+                        isSaved = true;
+                        updateSaveButton();
+                        console.log("Preferences saved successfully!");
+                        showFeedback("Preferences Saved!");
+                        return; // Success, exit function
+                    } catch (error) {
+                        if (i < MAX_RETRIES - 1) {
+                            const delay = Math.pow(2, i) * 1000;
+                            await new Promise(resolve => setTimeout(resolve, delay));
+                            // Do not log retry as error in console
+                        } else {
+                            throw error; // Re-throw the error on the last attempt
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error("Failed to save preferences:", error);
+                showFeedback("Error saving preferences. Check console.", true);
+            }
+        };
+
+        const loadPreferences = () => {
+            if (!db || !userId) {
+                 console.warn("Skipping real-time listener: Persistence is disabled.");
+                 return;
+            }
+
+            const prefsDocRef = getPrefsDocRef();
+            if (!prefsDocRef) return;
+
+            // Set up real-time listener
+            onSnapshot(prefsDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    currentPrefs = { ...DEFAULT_PREFS, ...data };
+                    renderUI(currentPrefs);
+                    isSaved = true;
+                } else {
+                    // Document doesn't exist, save defaults to create it
+                    savePreferences(DEFAULT_PREFS);
+                }
+                updateSaveButton();
+            }, (error) => {
+                console.error("Error listening to preferences:", error);
+                document.getElementById('loading-state').textContent = 'Error loading settings.';
+            });
+        };
+
+        // --- UI Rendering & State Management ---
+
+        const updateSaveButton = () => {
+            const saveBtn = document.getElementById('save-btn');
+            
+            // Only update save button state if persistence is enabled
+            if (db) {
+                if (isSaved) {
+                    saveBtn.disabled = true;
+                    saveBtn.textContent = 'Preferences Saved';
+                    saveBtn.classList.remove('bg-green-500', 'hover:bg-green-600', 'shadow-green-200');
+                    saveBtn.classList.add('bg-gray-300', 'text-gray-600', 'cursor-not-allowed');
+                } else {
+                    saveBtn.disabled = false;
+                    saveBtn.innerHTML = '<i data-lucide="save" class="w-5 h-5 inline mr-2"></i> Save Changes';
+                    saveBtn.classList.add('bg-green-500', 'hover:bg-green-600', 'shadow-green-200', 'shadow-md');
+                    saveBtn.classList.remove('bg-gray-300', 'text-gray-600', 'cursor-not-allowed');
+                    // Re-render icons after changing innerHTML
+                    if (window.createIcons) window.createIcons();
+                }
+            } else {
+                 // Persistence disabled, make button obvious
+                 saveBtn.disabled = true;
+                 saveBtn.innerHTML = '<i data-lucide="lock" class="w-5 h-5 inline mr-2"></i> Persistence Off';
+                 saveBtn.classList.remove('bg-green-500', 'hover:bg-green-600', 'shadow-green-200');
+                 saveBtn.classList.add('bg-gray-400', 'text-gray-800', 'cursor-not-allowed');
+                 if (window.createIcons) window.createIcons();
+            }
+        };
+
+        const handlePrefChange = (key, value) => {
+            currentPrefs[key] = value;
+            isSaved = false;
+            renderUI(currentPrefs); // Update UI elements that depend on the value
+            updateSaveButton();
+        };
+
+        const renderUI = (prefs) => {
+            // Update sound selection
+            const soundSelect = document.getElementById('sound-select');
+            if (soundSelect.value !== prefs.soundType) soundSelect.value = prefs.soundType;
+
+            // Update volume slider and label
+            const volumeSlider = document.getElementById('volume-slider');
+            const volumeLabel = document.getElementById('volume-label');
+            
+            const volumePercent = Math.round(prefs.volume * 100);
+
+            if (parseFloat(volumeSlider.value) !== prefs.volume) volumeSlider.value = prefs.volume;
+            volumeLabel.textContent = `${volumePercent}%`;
+            
+            // Update slider background dynamically
+            volumeSlider.style.background = `linear-gradient(to right, #6366f1 0%, #6366f1 ${volumePercent}%, #e0e7ff ${volumePercent}%, #e0e7ff 100%)`;
+
+            // Hide loading state
+            document.getElementById('loading-state').classList.add('hidden');
+            document.getElementById('app-content').classList.remove('hidden');
+            document.getElementById('user-id-display').textContent = userId;
+            
+            // Ensure icons are rendered after UI updates
+            if (window.createIcons) window.createIcons();
+        };
+
+        const setupEventListeners = () => {
+            document.getElementById('sound-select').innerHTML = SOUND_OPTIONS.map(opt => 
+                `<option value="${opt.value}">${opt.label}</option>`
+            ).join('');
+            
+            // Initial render based on defaults
+            renderUI(currentPrefs);
+
+            document.getElementById('sound-select').addEventListener('change', (e) => {
+                handlePrefChange('soundType', e.target.value);
+            });
+
+            document.getElementById('volume-slider').addEventListener('input', (e) => {
+                handlePrefChange('volume', parseFloat(e.target.value));
+            });
+
+            document.getElementById('test-btn').addEventListener('click', () => {
+                window.playAlarm(currentPrefs.soundType, currentPrefs.volume, currentPrefs.pitch);
+            });
+
+            document.getElementById('trigger-btn').addEventListener('click', () => {
+                window.playAlarm(currentPrefs.soundType, currentPrefs.volume, currentPrefs.pitch);
+                showFeedback("Notification Triggered!");
+            });
+
+            document.getElementById('save-btn').addEventListener('click', () => {
+                savePreferences(currentPrefs);
+            });
+        };
+        
+        const showFeedback = (message, isError = false) => {
+            const feedbackBox = document.getElementById('feedback-box');
+            feedbackBox.textContent = message;
+            feedbackBox.classList.remove('hidden', 'bg-green-100', 'border-green-400', 'text-green-700', 'bg-red-100', 'border-red-400', 'text-red-700');
+            
+            if (isError) {
+                feedbackBox.classList.add('bg-red-100', 'border-red-400', 'text-red-700');
+            } else {
+                feedbackBox.classList.add('bg-green-100', 'border-green-400', 'text-green-700');
+            }
+            
+            setTimeout(() => {
+                feedbackBox.classList.add('hidden');
+            }, 3000);
+        };
+
+
+        // --- Main Initialization ---
+        window.addEventListener('load', async () => {
+            const loadingStateElement = document.getElementById('loading-state');
+            userId = crypto.randomUUID(); // Default ID, may be overwritten by Firebase Auth
+            
+            if (!isEnvironmentConfigProvided) {
+                loadingStateElement.textContent = 'Warning: Persistence disabled. Firebase config is missing.';
+                loadingStateElement.classList.add('bg-yellow-100', 'text-yellow-800', 'rounded-lg');
+                setupEventListeners();
+                renderUI(currentPrefs);
+                updateSaveButton(); 
+                return; 
+            }
+            
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // 1. Authenticate
+                let user = auth.currentUser;
+                if (!user) {
+                    if (initialAuthToken) {
+                        user = (await signInWithCustomToken(auth, initialAuthToken)).user;
+                    } else {
+                        user = (await signInAnonymously(auth)).user;
+                    }
+                }
+                userId = user.uid;
+
+                // 2. Load and listen for preferences
+                loadPreferences();
+                
+                // 3. Setup UI
+                setupEventListeners();
+                updateSaveButton(); // Also ensures correct initial state when persistence is ON
+
+            } catch (error) {
+                console.error("Failed to initialize App or Auth:", error);
+                // If initialization fails, fall back to non-persistent mode
+                db = null; // Ensure db is null so Persistence Off state is correctly displayed
+                loadingStateElement.textContent = `Initialization Error: ${error.message}. Persistence disabled.`;
+                loadingStateElement.classList.add('bg-red-100', 'text-red-800', 'rounded-lg');
+                setupEventListeners(); // Still set up UI
+                updateSaveButton(); 
+            }
+        });
+    </script>
+</head>
+<body class="bg-gray-50 antialiased">
+
+    <div id="feedback-box" class="hidden absolute top-4 right-4 p-3 rounded-xl border shadow-xl transition-all duration-300 z-50 min-w-[250px] text-sm"></div>
+
+    <div class="min-h-screen flex items-center justify-center p-4">
+        <div class="w-full max-w-lg bg-white shadow-2xl rounded-xl p-6 md:p-8 space-y-8">
+            
+            <!-- Loading State -->
+            <div id="loading-state" class="text-center p-8">
+                <div class="flex items-center justify-center space-x-3">
+                    <div class="animate-spin rounded-full h-6 w-6 border-t-2 border-b-2 border-indigo-600"></div>
+                    <p class="text-lg font-medium text-indigo-600">Loading Configuration...</p>
+                </div>
+            </div>
+
+            <!-- Application Content -->
+            <div id="app-content" class="hidden">
+                <header class="text-center border-b pb-4">
+                    <h1 class="text-3xl font-extrabold text-gray-800 flex items-center justify-center">
+                        <i data-lucide="bell" class="w-7 h-7 mr-3 text-indigo-500"></i>
+                        Alarm Configurator
+                    </h1>
+                    <p class="text-sm text-gray-500 mt-1 break-all">User ID: <code class="bg-gray-200 px-2 py-0.5 rounded text-xs select-all" id="user-id-display">Loading...</code></p>
+                </header>
+
+                <!-- Trigger Button -->
+                <button id="trigger-btn" class="w-full px-6 py-4 text-xl font-bold rounded-xl bg-red-500 text-white hover:bg-red-600 transition duration-200 transform hover:scale-[1.01] shadow-xl shadow-red-300 focus:outline-none focus:ring-4 focus:ring-red-300 flex items-center justify-center">
+                    <i data-lucide="alert-triangle" class="w-6 h-6 mr-3"></i>
+                    Trigger Notification Event
+                </button>
+
+                <!-- Configuration Panel -->
+                <section class="space-y-6 border border-gray-200 p-5 rounded-xl shadow-sm">
+                    <h2 class="text-xl font-bold text-gray-700 flex items-center">
+                        <i data-lucide="sliders" class="w-5 h-5 mr-2 text-indigo-500"></i>
+                        Alarm Settings
+                    </h2>
+                    
+                    <!-- Sound Selection -->
+                    <div class="flex flex-col space-y-2">
+                        <label for="sound-select" class="text-sm font-semibold text-gray-700 flex items-center">
+                            <i data-lucide="volume-2" class="w-4 h-4 mr-2 text-indigo-400"></i>
+                            Alarm Tone Selection
+                        </label>
+                        <select id="sound-select" class="w-full p-3 border border-gray-300 rounded-lg shadow-sm focus:ring-indigo-500 focus:border-indigo-500 transition duration-150 ease-in-out bg-white appearance-none pr-10">
+                            <!-- Options populated by JS -->
+                        </select>
+                        <p class="text-xs text-gray-500 mt-1">Select the type of synthesized audio wave for the notification.</p>
+                    </div>
+
+                    <!-- Volume Slider -->
+                    <div class="flex flex-col space-y-4">
+                        <label class="text-sm font-semibold text-gray-700 flex justify-between items-center">
+                            <span>Volume Level</span>
+                            <span class="font-bold text-indigo-600" id="volume-label">50%</span>
+                        </label>
+                        <input
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.01"
+                            value="0.5"
+                            id="volume-slider"
+                            class="w-full range-lg"
+                        />
+                    </div>
+                </section>
+
+                <!-- Action Buttons -->
+                <div class="flex flex-col sm:flex-row space-y-3 sm:space-y-0 sm:space-x-4 justify-center">
+
+                    <button id="test-btn" class="flex-1 px-6 py-3 text-lg font-semibold rounded-xl border border-indigo-500 text-indigo-600 bg-indigo-50 hover:bg-indigo-100 transition duration-200 transform hover:scale-[1.02] focus:outline-none focus:ring-4 focus:ring-indigo-300 shadow-md">
+                        <i data-lucide="play" class="w-5 h-5 inline mr-2"></i>
+                        Test Sound
+                    </button>
+
+                    <button
+                        id="save-btn"
+                        disabled
+                        class="flex-1 px-6 py-3 text-lg font-semibold rounded-xl transition duration-200 focus:outline-none focus:ring-4 focus:ring-green-300 disabled:bg-gray-300 disabled:text-gray-600 disabled:cursor-not-allowed"
+                    >
+                        Preferences Saved
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
